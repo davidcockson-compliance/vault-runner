@@ -1,0 +1,327 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="grid">
+
+  <!-- ── Job submission form ── -->
+  <div class="card full">
+    <h2>Submit Job</h2>
+    <form id="job-form"
+          hx-post="/jobs"
+          hx-target="#submit-result"
+          hx-swap="innerHTML"
+          enctype="multipart/form-data">
+
+      <div class="form-2col">
+        <div class="form-row">
+          <label for="model">Model</label>
+          <select id="model" name="model">
+            {% for m in models %}
+            <option value="{{ m }}"{% if m == default_model %} selected{% endif %}>{{ m }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="form-row">
+          <label for="job_type">Type</label>
+          <select id="job_type" name="job_type" onchange="onTypeChange(this.value)">
+            <option value="text">text</option>
+            <option value="vision">vision</option>
+            <option value="staged">staged</option>
+            <option value="chain">chain</option>
+            <option value="chain_planner">chain planner</option>
+          </select>
+        </div>
+      </div>
+
+
+      <div class="form-row" id="image-row" style="display:none">
+        <label for="image">Image file</label>
+        <input type="file" id="image" name="image" accept="image/*">
+      </div>
+
+      <div class="form-row" id="attachment-row" style="display:none">
+        <label for="attachment">Attach file <span style="color:var(--muted);font-size:0.75rem">(.txt, .md — appended to prompt)</span></label>
+        <input type="file" id="attachment" name="attachment" accept=".txt,.md,.csv">
+      </div>
+
+      <!-- Regular prompt — text / vision / staged / chain_planner -->
+      <div class="form-row" id="prompt-row">
+        <label for="prompt" id="prompt-label">Prompt</label>
+        <textarea id="prompt" name="prompt" placeholder="Enter your prompt here…"></textarea>
+      </div>
+
+      <!-- Chain builder — shown when type = chain -->
+      <div id="chain-section" style="display:none">
+        <div class="form-row">
+          <label for="template-picker">Template</label>
+          <select id="template-picker" onchange="loadTemplate(this.value)">
+            <option value="">— start from scratch —</option>
+          </select>
+        </div>
+        <div id="step-list" style="margin-bottom:0.75rem"></div>
+        <button type="button" class="btn btn-sm" onclick="addStep()" style="margin-bottom:0.875rem">+ Add Step</button>
+        <input type="hidden" id="chain_data" name="chain_data">
+      </div>
+
+      <div class="form-row" id="memory-row" style="display:flex;align-items:center;gap:0.5rem">
+        <input type="checkbox" id="use_memory" name="use_memory" value="true">
+        <label for="use_memory" style="margin:0;cursor:pointer">
+          Use memory
+          <span style="color:var(--muted);font-size:0.75rem">(inject relevant prior context before each Ollama call)</span>
+        </label>
+      </div>
+
+      <div class="form-row" style="display:flex;align-items:center;gap:0.5rem">
+        <label for="retries" style="margin:0">Retries</label>
+        <input type="number" id="retries" name="retries" value="0" min="0" max="10" style="width:60px">
+        <span style="color:var(--muted);font-size:0.75rem">(requeue on failure, 0 = none)</span>
+      </div>
+
+      <button type="submit" class="btn">Submit Job</button>
+    </form>
+    <div id="submit-result"></div>
+  </div>
+
+  <!-- ── Memory search ── -->
+  <div class="card full">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.75rem">
+      <h2 style="margin:0">Memory Search</h2>
+      <div hx-get="/memory/status"
+           hx-trigger="load"
+           hx-swap="innerHTML"></div>
+    </div>
+    <input type="text"
+           placeholder="Search prior outputs and indexed sources…"
+           style="width:100%;margin-bottom:0.5rem"
+           hx-get="/memory/search"
+           hx-target="#memory-results"
+           hx-trigger="keyup changed delay:400ms"
+           name="q">
+    <div id="memory-results"></div>
+  </div>
+
+  <!-- ── Queue status ── -->
+  <div class="card"
+       hx-get="/partials/queue"
+       hx-trigger="load, every 5s"
+       hx-swap="innerHTML">
+    <div class="empty">Loading…</div>
+  </div>
+
+  <!-- ── Recent output ── -->
+  <div class="card"
+       hx-get="/partials/output"
+       hx-trigger="load, every 5s"
+       hx-swap="innerHTML">
+    <div class="empty">Loading…</div>
+  </div>
+
+  <!-- ── Live runner log ── -->
+  <div class="card full"
+       hx-get="/partials/logs"
+       hx-trigger="load, every 8s"
+       hx-swap="innerHTML">
+    <div class="empty">Loading…</div>
+  </div>
+
+</div>
+
+<script>
+  // ── State ──────────────────────────────────────────────────────────────────
+  let stepCounter = 0;
+  const MODELS  = {{ models | tojson }};
+  const RUNNERS = {{ runners | tojson }};
+  let _templates = [];
+
+  // ── Type switching ─────────────────────────────────────────────────────────
+  function onTypeChange(type) {
+    const isChain        = type === 'chain';
+    const isPlanner      = type === 'chain_planner';
+    const isVision       = type === 'vision';
+    const hasAttachment  = !isChain && !isVision;
+
+    document.getElementById('prompt-row').style.display      = isChain ? 'none' : '';
+    document.getElementById('chain-section').style.display   = isChain ? ''     : 'none';
+    document.getElementById('image-row').style.display       = isVision ? ''    : 'none';
+    document.getElementById('attachment-row').style.display  = hasAttachment ? '' : 'none';
+
+    const lbl = document.getElementById('prompt-label');
+    const ta  = document.getElementById('prompt');
+    if (type === 'staged') {
+      lbl.textContent = 'Steps';
+      ta.placeholder  = '- [ ] First task\n- [ ] Second task (gets context from first)\n- [ ] Third task';
+    } else if (isPlanner) {
+      lbl.textContent = 'Goal';
+      ta.placeholder  = 'Describe what you want to achieve\u2026 the model will plan and execute its own steps.';
+    } else {
+      lbl.textContent = 'Prompt';
+      ta.placeholder  = 'Enter your prompt here\u2026';
+    }
+  }
+
+  // ── Step builder helpers ───────────────────────────────────────────────────
+  function _modelOpts(sel) {
+    return MODELS.map(m =>
+      `<option value="${m}"${m === sel ? ' selected' : ''}>${m}</option>`
+    ).join('');
+  }
+  function _runnerOpts(sel) {
+    const opts = [`<option value="">default</option>`];
+    RUNNERS.forEach(r =>
+      opts.push(`<option value="${r}"${r === sel ? ' selected' : ''}>${r}</option>`)
+    );
+    return opts.join('');
+  }
+
+  function _toggleStepType(select, id) {
+    const el       = document.getElementById(id);
+    const isVision = select.value === 'vision';
+    const isSearch = select.value === 'search';
+    el.querySelector('.step-image-row').style.display  = isVision ? '' : 'none';
+    el.querySelector('.step-prompt-row').style.display = isSearch ? 'none' : '';
+    el.querySelector('.step-search-row').style.display = isSearch ? '' : 'none';
+    el.querySelector('.step-model-row').style.display  = isSearch ? 'none' : '';
+  }
+
+  function addStep(promptText = '', stepType = 'text', stepModel = '', stepMeta = {}) {
+    const n      = ++stepCounter;
+    const id     = `step-${n}`;
+    const isSearch = stepType === 'search';
+    const div    = document.createElement('div');
+    div.id = id;
+    div.style.cssText = [
+      'border:1px solid var(--border)',
+      'border-radius:4px',
+      'padding:0.75rem',
+      'margin-bottom:0.5rem',
+    ].join(';');
+    div.innerHTML = `
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.5rem">
+        <div style="display:flex;align-items:center;gap:0.5rem">
+          <span style="color:var(--muted);font-size:0.72rem;text-transform:uppercase;letter-spacing:0.1em">Step ${n}</span>
+          <select class="step-type"
+                  onchange="_toggleStepType(this,'${id}')"
+                  style="font-size:0.72rem;padding:0.15rem 0.35rem;width:auto">
+            <option value="text"${stepType==='text'?' selected':''}>text</option>
+            <option value="vision"${stepType==='vision'?' selected':''}>vision</option>
+            <option value="search"${stepType==='search'?' selected':''}>search</option>
+          </select>
+        </div>
+        <button type="button" class="btn btn-sm"
+                style="background:var(--red);color:var(--bg);padding:0.15rem 0.5rem"
+                onclick="document.getElementById('${id}').remove()">×</button>
+      </div>
+      <div class="step-image-row" style="display:${stepType==='vision'?'':'none'};margin-bottom:0.5rem">
+        <label style="font-size:0.7rem">Image file</label>
+        <input type="file" class="step-image" name="step_image_${n}" accept="image/*">
+      </div>
+      <div class="step-prompt-row" style="display:${isSearch?'none':''}">
+        <textarea class="step-prompt" placeholder="Step ${n} prompt\u2026"
+                  style="min-height:60px;margin-bottom:0.5rem;width:100%">${promptText}</textarea>
+      </div>
+      <div class="step-search-row" style="display:${isSearch?'':'none'}">
+        <input class="step-query" placeholder="Search query\u2026"
+               style="width:100%;margin-bottom:0.4rem"
+               value="${(stepMeta.query||'').replace(/"/g,'&quot;')}">
+        <div style="display:flex;gap:0.5rem">
+          <input class="step-categories" placeholder="categories (e.g. it)"
+                 style="flex:1" value="${stepMeta.categories||''}">
+          <input class="step-engines" placeholder="engines (e.g. github,stackoverflow)"
+                 style="flex:2" value="${stepMeta.engines||''}">
+        </div>
+        <div style="color:var(--muted);font-size:0.7rem;margin-top:0.3rem">
+          categories and engines are optional — leave blank to use defaults
+        </div>
+      </div>
+      <div class="step-model-row" style="display:${isSearch?'none':''}">
+        <label style="font-size:0.7rem">Model</label>
+        <select class="step-model">${_modelOpts(stepModel)}</select>
+      </div>
+    `;
+    document.getElementById('step-list').appendChild(div);
+  }
+
+  function serializeChain() {
+    const steps = [];
+    document.querySelectorAll('#step-list > div').forEach(div => {
+      const type    = div.querySelector('.step-type').value;
+      const cardNum = div.id.split('-')[1];
+      if (type === 'search') {
+        const query = div.querySelector('.step-query').value.trim();
+        if (!query) return;
+        const s = { action: 'search', query };
+        const cats = div.querySelector('.step-categories').value.trim();
+        const engs = div.querySelector('.step-engines').value.trim();
+        if (cats) s.categories = cats;
+        if (engs) s.engines = engs;
+        steps.push(s);
+      } else {
+        const prompt  = div.querySelector('.step-prompt').value.trim();
+        const model   = div.querySelector('.step-model').value;
+        if (!prompt) return;
+        const isVision = type === 'vision';
+        if (model || isVision) {
+          const s = { prompt };
+          if (model)    s.model = model;
+          if (isVision) { s.type = 'vision'; s._img_key = `step_image_${cardNum}`; }
+          steps.push(s);
+        } else {
+          steps.push(prompt);
+        }
+      }
+    });
+    return steps;
+  }
+
+  // ── Template loading ───────────────────────────────────────────────────────
+  async function _fetchTemplates() {
+    try {
+      const resp = await fetch('/api/templates');
+      _templates = await resp.json();
+      const picker = document.getElementById('template-picker');
+      _templates.forEach((t, i) => {
+        const opt = document.createElement('option');
+        opt.value = i;
+        opt.textContent = t.name;
+        picker.appendChild(opt);
+      });
+    } catch (_) {}
+  }
+
+  function loadTemplate(idx) {
+    if (idx === '') return;
+    const tpl = _templates[parseInt(idx)];
+    if (!tpl) return;
+    document.getElementById('step-list').innerHTML = '';
+    stepCounter = 0;
+    if (tpl.model)  document.getElementById('model').value  = tpl.model;
+    if (tpl.runner) document.getElementById('runner').value = tpl.runner;
+    (tpl.steps || []).forEach(s => {
+      if (typeof s === 'string') addStep(s);
+      else if (s.action === 'search') addStep('', 'search', '', s);
+      else addStep(s.prompt || '', s.type || 'text', s.model || '');
+    });
+  }
+
+  // ── HTMX pre-submit: inject chain_data into request parameters ───────────
+  // htmx:configRequest fires after form data is collected — safe to modify params here
+  document.getElementById('job-form').addEventListener('htmx:configRequest', function (e) {
+    if (document.getElementById('job_type').value !== 'chain') return;
+    const steps = serializeChain();
+    if (steps.length === 0) {
+      e.preventDefault();
+      alert('Add at least one step before submitting.');
+      return;
+    }
+    const chainJson = JSON.stringify(steps);
+    if (e.detail.parameters instanceof FormData) {
+      e.detail.parameters.set('chain_data', chainJson);
+      e.detail.parameters.set('prompt', '_chain_');
+    } else {
+      e.detail.parameters['chain_data'] = chainJson;
+      e.detail.parameters['prompt'] = '_chain_';
+    }
+  });
+
+  _fetchTemplates();
+</script>
+{% endblock %}

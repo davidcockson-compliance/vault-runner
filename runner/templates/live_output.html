@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% block title %}{{ job_id }} — Live Output{% endblock %}
+{% block content %}
+<div class="card">
+  <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1rem">
+    <h2>{{ job_id }}</h2>
+    <div style="display:flex; gap:0.75rem; align-items:center">
+      <span id="status-badge" class="badge badge-active">● streaming</span>
+      <a href="/" class="back-link">← back</a>
+    </div>
+  </div>
+
+  <pre id="output" class="output-pre" style="min-height:200px; max-height:75vh; overflow-y:auto"></pre>
+
+  <div id="done-bar" style="display:none; margin-top:0.75rem">
+    <a href="/output/{{ job_id }}" class="btn btn-sm">View full output →</a>
+  </div>
+</div>
+
+<script>
+  const outputEl = document.getElementById('output');
+  const statusBadge = document.getElementById('status-badge');
+  const doneBar = document.getElementById('done-bar');
+
+  const es = new EventSource('/api/jobs/{{ job_id }}/stream');
+
+  es.onmessage = function(e) {
+    let msg;
+    try { msg = JSON.parse(e.data); } catch { return; }
+
+    if (msg.t !== undefined) {
+      outputEl.textContent += msg.t;
+      outputEl.scrollTop = outputEl.scrollHeight;
+      return;
+    }
+    if (msg.done) {
+      es.close();
+      statusBadge.className = 'badge badge-done';
+      statusBadge.textContent = '✓ complete';
+      doneBar.style.display = 'block';
+      return;
+    }
+    if (msg.error) {
+      es.close();
+      statusBadge.className = 'badge badge-fail';
+      statusBadge.textContent = '✗ failed';
+      outputEl.textContent += '\n\n[Error: ' + msg.error + ']';
+      return;
+    }
+    if (msg.cancelled) {
+      es.close();
+      statusBadge.className = 'badge badge-fail';
+      statusBadge.textContent = '✗ cancelled';
+      outputEl.textContent += '\n\n[Cancelled]';
+      return;
+    }
+  };
+</script>
+{% endblock %}

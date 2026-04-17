@@ -1,0 +1,6 @@
+<h2>Runner Log</h2>
+{% if log_content %}
+<pre class="log-pre">{{ log_content }}</pre>
+{% else %}
+<div class="empty">No logs yet — drop a job in _queue/ to start</div>
+{% endif %}

@@ -1,0 +1,20 @@
+[Unit]
+Description=Obsidian LLM Runner Web UI
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/runner
+# RUNNER_CONFIG tells web.py where the shared config lives
+Environment=RUNNER_CONFIG=/opt/runner/config.yaml
+ExecStart=/opt/runner/venv/bin/uvicorn web:app --host 127.0.0.1 --port 8000 --workers 1
+Restart=on-failure
+RestartSec=10
+
+# Log to journald — view with: journalctl -u obsidian-runner-web -f
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=obsidian-runner-web
+
+[Install]
+WantedBy=multi-user.target

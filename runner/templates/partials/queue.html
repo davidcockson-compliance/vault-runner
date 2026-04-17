@@ -1,0 +1,36 @@
+<h2>Queue</h2>
+{% if active_files %}
+<ul class="item-list" style="margin-bottom:0.75rem">
+  {% for f in active_files %}
+  <li style="display:flex;align-items:center;gap:0.5rem">
+    <span class="badge badge-active">active</span>
+    <span style="flex:1">{{ f }}</span>
+    <a href="/jobs/{{ f }}/live" target="_blank" rel="noopener"
+       style="font-size:0.75rem;color:var(--accent);text-decoration:none;white-space:nowrap">live ↗</a>
+    <button hx-post="/jobs/{{ f }}/cancel"
+            hx-target="closest .card" hx-swap="innerHTML"
+            style="font-size:0.75rem;padding:0.15rem 0.5rem;background:var(--red,#c0392b);color:#fff;border:none;border-radius:3px;cursor:pointer">
+      cancel
+    </button>
+  </li>
+  {% endfor %}
+</ul>
+{% endif %}
+{% if queue_files %}
+<ul class="item-list">
+  {% for f in queue_files %}
+  <li style="display:flex;align-items:center;gap:0.5rem">
+    <span class="badge badge-queue">queued</span>
+    <span style="flex:1">{{ f }}</span>
+    <button hx-post="/jobs/{{ f }}/cancel"
+            hx-target="closest .card" hx-swap="innerHTML"
+            style="font-size:0.75rem;padding:0.15rem 0.5rem;background:var(--red,#c0392b);color:#fff;border:none;border-radius:3px;cursor:pointer">
+      cancel
+    </button>
+  </li>
+  {% endfor %}
+</ul>
+{% endif %}
+{% if not queue_files and not active_files %}
+<div class="empty">Queue empty</div>
+{% endif %}

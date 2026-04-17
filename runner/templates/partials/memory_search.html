@@ -1,0 +1,17 @@
+{% if query %}
+  {% if results %}
+  <ul class="item-list">
+    {% for r in results %}
+    <li style="flex-direction:column;align-items:flex-start;gap:0.25rem;padding:0.5rem 0">
+      <div style="display:flex;align-items:center;gap:0.5rem">
+        <span class="badge badge-done" style="font-size:0.65rem">{{ "%.2f"|format(r.similarity) }}</span>
+        <span style="font-size:0.75rem;color:var(--muted)">{{ r.source_file }}</span>
+      </div>
+      <p style="margin:0;font-size:0.82rem;white-space:pre-wrap">{{ r.text[:400] }}{% if r.text|length > 400 %}…{% endif %}</p>
+    </li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <div class="empty">No results for "{{ query }}"</div>
+  {% endif %}
+{% endif %}

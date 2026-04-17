@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block title %}{{ job_id }} — Runner Output{% endblock %}
+{% block content %}
+<div class="card">
+  <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1rem">
+    <h2>{{ job_id }}</h2>
+    <a href="/" class="back-link">← back</a>
+  </div>
+  <pre class="output-pre">{{ content_html|safe }}</pre>
+</div>
+{% endblock %}

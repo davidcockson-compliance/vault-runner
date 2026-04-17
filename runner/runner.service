@@ -1,0 +1,20 @@
+[Unit]
+Description=Obsidian LLM Runner
+# Start after network is up and Docker is running (Ollama + Tempo need to be ready)
+After=network.target docker.service
+Wants=docker.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/runner
+ExecStart=/opt/runner/venv/bin/python /opt/runner/runbook.py /opt/runner/config.yaml
+Restart=on-failure
+RestartSec=10
+
+# Log to journald — view with: journalctl -u obsidian-runner -f
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=obsidian-runner
+
+[Install]
+WantedBy=multi-user.target

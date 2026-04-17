@@ -1,0 +1,13 @@
+{% if success %}
+<div class="notif notif-ok">
+  Queued: <code>{{ job_id }}</code>
+  {% if trace_id %} — trace: <code>{{ trace_id }}</code>{% endif %}
+  {% if job_type in ('text', 'vision') %}
+  — <a href="/jobs/{{ job_id }}/live" style="color:inherit; font-weight:bold">watch live →</a>
+  {% endif %}
+</div>
+{% else %}
+<div class="notif notif-err">
+  Error: {{ message or "submission failed — check logs" }}
+</div>
+{% endif %}

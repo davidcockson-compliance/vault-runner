@@ -1,0 +1,126 @@
+# vault-runner — example config
+# Copy to config.yaml and edit for your environment.
+
+# Root of your synced Obsidian vault on this machine.
+# On the server this is wherever Syncthing drops the vault.
+vault_path: /path/to/vault
+
+dirs:
+  queue:     /path/to/vault/_queue
+  active:    /path/to/vault/_active
+  output:    /path/to/vault/runner-outputs
+  completed: /path/to/vault/_completed
+  failed:    /path/to/vault/_failed
+  log_file:  /path/to/vault/RUNNER-LOG.md
+
+ollama:
+  base_url:      http://localhost:11434
+  default_model: qwen2.5:14b
+  available_models:
+    - qwen2.5:14b
+    - gemma3:4b
+  timeout:       600   # single text/vision jobs (seconds)
+  chain_timeout: 900   # chain/staged steps — longer due to accumulated context
+
+# Per-machine runner endpoints. Add a second machine here to distribute work.
+runners:
+  primary:
+    base_url:      http://localhost:11434
+    default_model: qwen2.5:14b
+  secondary:
+    base_url:      http://10.0.0.2:11434   # e.g. Tailscale IP of a home-lab box
+    default_model: gemma3:4b
+
+# Model → runner auto-routing. The runner picks the machine from the model name.
+model_runners:
+  qwen2.5:14b: primary
+  gemma3:4b:   secondary
+
+# OpenTelemetry — traces shipped to Tempo/Grafana. Leave endpoint blank to disable.
+otel:
+  endpoint:     http://localhost:4317
+  service_name: vault-runner
+
+# Discord alerts — leave blank to disable.
+discord:
+  webhook_url: ""
+
+# SearXNG metasearch for `action: search` chain steps.
+searxng:
+  base_url: http://searxng.local
+  default_categories: it
+  num_results: 10
+  timeout: 30
+  enabled: false
+
+# MemPalace — semantic memory over past outputs and vault content (see ./mempalace).
+mempalace:
+  enabled: false
+  store_path: /path/to/mempalace-store
+  pre_job_results: 3
+  max_chars_per_result: 400
+  smart_query_model: qwen2.5:7b
+  smart_query_results_per_query: 2
+
+poll_interval: 5
+num_workers: 2
+
+# Chain job templates shown in the UI template picker.
+templates:
+  - name: "Quick Model Test"
+    model: qwen2.5:14b
+    steps:
+      - prompt: "Write 3 bullet points about why local LLMs are useful. Keep it brief."
+        model: qwen2.5:14b
+      - prompt: "Review the 3 points above and add one sentence of critique to each."
+        model: qwen2.5:14b
+
+  - name: "Web Search"
+    model: qwen2.5:14b
+    steps:
+      - action: search
+        query: ""
+        categories: it
+      - prompt: |
+          Analyse the search results above. Extract the most relevant and reliable information.
+          List key findings with source URLs. Flag thin coverage or conflicting sources.
+        model: qwen2.5:14b
+      - prompt: |
+          Using the analysis above, write a clear structured answer to the original query.
+          Include: key conclusions, important caveats, and 3–5 actionable next steps.
+        model: qwen2.5:14b
+
+  - name: "Vault Search"
+    model: qwen2.5:14b
+    use_memory: true
+    steps:
+      - prompt: |
+          The vault context above is drawn from your knowledge base.
+          Synthesise: list key facts, frameworks, definitions, and open questions.
+        model: qwen2.5:14b
+      - prompt: |
+          Using the briefing above, write a structured answer with:
+          - What is known
+          - Knowledge gaps
+          - Most important concepts
+          - Suggested follow-ups
+        model: qwen2.5:14b
+
+  - name: "Document Analysis"
+    model: qwen2.5:14b
+    steps:
+      - prompt: |
+          Extract key information from the document: facts, claims, figures, arguments, quotes.
+          Organise under headings. Extract only — do not interpret yet.
+        model: qwen2.5:14b
+      - prompt: |
+          Analyse the extraction above. Evaluate argument strength, identify gaps,
+          flag unsupported claims, note what context would improve the output.
+        model: qwen2.5:14b
+      - prompt: |
+          Write a structured output with:
+          - Executive summary (2–3 sentences)
+          - Key findings
+          - Critical analysis and gaps
+          - Recommendations or next steps
+        model: qwen2.5:14b

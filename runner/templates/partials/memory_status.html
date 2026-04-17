@@ -1,0 +1,5 @@
+{% if enabled %}
+<span class="badge badge-done" title="MemPalace active">{{ count }} indexed</span>
+{% else %}
+<span class="badge" style="background:var(--muted);color:var(--bg)" title="MemPalace disabled">memory off</span>
+{% endif %}

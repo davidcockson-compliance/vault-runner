@@ -1,0 +1,21 @@
+<h2>Output</h2>
+{% if output_files %}
+<ul class="item-list">
+  {% for f in output_files %}
+  <li>
+    <span class="badge badge-done">done</span>
+    <a href="/output/{{ f.stem }}">{{ f.job_id }}</a>
+  </li>
+  {% endfor %}
+</ul>
+{% endif %}
+{% if failed %}
+<ul class="item-list" style="margin-top:0.75rem">
+  {% for f in failed %}
+  <li><span class="badge badge-fail">failed</span>{{ f }}</li>
+  {% endfor %}
+</ul>
+{% endif %}
+{% if not output_files and not failed %}
+<div class="empty">No output yet</div>
+{% endif %}

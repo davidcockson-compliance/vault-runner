@@ -1,0 +1,33 @@
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ruff_cache/
+venv/
+.venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# Real config — never commit
+runner/config.yaml
+config.yaml
+
+# Runtime state
+_queue/*
+_active/*
+_completed/*
+_failed/*
+runner-outputs/
+RUNNER-LOG.md
+!vault-example/**/.gitkeep
+
+# MemPalace store
+mempalace-store/
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+*.swp
