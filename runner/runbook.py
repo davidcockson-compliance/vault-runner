@@ -9,6 +9,7 @@ Emits structured JSON logs to RUNNER-LOG.md and OpenTelemetry traces to Tempo.
 import base64
 import json
 import logging
+import os
 import shutil
 import sys
 import threading
@@ -489,6 +490,253 @@ def call_searxng(query: str, cfg: dict, categories: str = None, engines: str = N
     return "\n".join(lines)
 
 
+# ─── Cloud LLM providers ─────────────────────────────────────────────────────
+
+def _get_api_key(env_var: str) -> str:
+    val = os.environ.get(env_var, "").strip()
+    if not val:
+        raise EnvironmentError(f"API key env var not set or empty: {env_var}")
+    return val
+
+
+def call_cloud_provider(provider: str, provider_cfg: dict, model: str, prompt: str) -> dict:
+    """
+    Unified call to Groq / Gemini / Anthropic / HuggingFace.
+    Groq, Gemini, and HuggingFace expose OpenAI-compatible endpoints; Anthropic uses its own SDK.
+    Returns a dict with 'response' and 'eval_count' matching the call_ollama() interface.
+    """
+    api_key = _get_api_key(provider_cfg["api_key_env"])
+    timeout = provider_cfg.get("timeout", 60)
+
+    if provider == "anthropic":
+        import anthropic as anthropic_sdk
+        client = anthropic_sdk.Anthropic(api_key=api_key)
+        msg = client.messages.create(
+            model=model,
+            max_tokens=provider_cfg.get("max_tokens", 8192),
+            messages=[{"role": "user", "content": prompt}],
+            timeout=timeout,
+        )
+        return {
+            "response": msg.content[0].text,
+            "eval_count": msg.usage.output_tokens,
+            "input_tokens": msg.usage.input_tokens,
+        }
+
+    # Groq, Gemini, HuggingFace — all OpenAI-compatible
+    from openai import OpenAI
+    client = OpenAI(base_url=provider_cfg["base_url"], api_key=api_key, timeout=timeout)
+    completion = client.chat.completions.create(
+        model=model,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    usage = completion.usage
+    return {
+        "response": completion.choices[0].message.content,
+        "eval_count": usage.completion_tokens if usage else 0,
+        "input_tokens": usage.prompt_tokens if usage else 0,
+    }
+
+
+# ─── Tavily search ────────────────────────────────────────────────────────────
+
+def call_tavily(query: str, cfg: dict, categories: str = None) -> str:
+    """
+    Query Tavily search API. Returns formatted markdown of top results.
+    Used by action: search in chain steps (preferred over SearXNG when key is set).
+    """
+    from tavily import TavilyClient
+    research_cfg = cfg.get("research", {})
+    api_key = _get_api_key(research_cfg.get("tavily_api_key_env", "TAVILY_API_KEY"))
+    max_results = research_cfg.get("max_results", 10)
+    search_depth = research_cfg.get("default_search_depth", "basic")
+
+    client = TavilyClient(api_key=api_key)
+    resp = client.search(query=query, search_depth=search_depth, max_results=max_results)
+
+    results = resp.get("results", [])
+    if not results:
+        return f"No results found for: {query}"
+
+    lines = [f"## Search Results: {query}\n"]
+    for i, r in enumerate(results, 1):
+        lines.append(f"### {i}. {r.get('title', 'No title')}")
+        lines.append(f"URL: {r.get('url', '')}")
+        lines.append(r.get("content", ""))
+        lines.append("")
+    return "\n".join(lines)
+
+
+# ─── URL fetch + content extraction ──────────────────────────────────────────
+
+def call_url_fetch(url: str) -> str:
+    """
+    Fetch a URL and extract the main readable content using trafilatura.
+    Used by action: fetch in chain steps.
+    """
+    import trafilatura
+    downloaded = trafilatura.fetch_url(url)
+    if not downloaded:
+        raise ValueError(f"Failed to fetch URL: {url}")
+    text = trafilatura.extract(downloaded, include_comments=False, include_tables=True)
+    if not text:
+        raise ValueError(f"No extractable content at: {url}")
+    return f"## Fetched: {url}\n\n{text}"
+
+
+# ─── GitLab CI/CD actions ─────────────────────────────────────────────────────
+
+def call_gitlab_push(content: str, post, cfg: dict, logger: "RunnerLogger") -> str:
+    """
+    Push content as a file to a GitLab repo and open an MR.
+    Uses the previous chain step's output as the file content.
+    Config: gitlab.token_env, gitlab.scripts_project_path, gitlab.default_branch.
+    """
+    gl_cfg = cfg.get("gitlab", {})
+    token = _get_api_key(gl_cfg.get("token_env", "GITLAB_TOKEN"))
+    base_url = gl_cfg.get("base_url", "https://gitlab.com")
+    project_path = gl_cfg.get("scripts_project_path", "")
+    default_branch = gl_cfg.get("default_branch", "main")
+
+    if not project_path:
+        raise ValueError("gitlab.scripts_project_path not set in config")
+
+    job_id = post.get("job_id", "runner-job")
+    branch = f"generated/{job_id}"
+    file_path = f"generated/{job_id}.py"
+    encoded = base64.b64encode(project_path.encode()).decode().replace("/", "%2F").replace("+", "%2B")
+    project_encoded = base64.b64encode(project_path.encode()).decode()
+    project_url_part = project_path.replace("/", "%2F")
+
+    headers = {"PRIVATE-TOKEN": token, "Content-Type": "application/json"}
+    api = f"{base_url}/api/v4/projects/{project_url_part}"
+
+    # Create branch
+    requests.post(f"{api}/repository/branches", headers=headers, json={
+        "branch": branch, "ref": default_branch
+    })
+
+    # Check if file exists (create vs update)
+    check = requests.get(f"{api}/repository/files/{file_path.replace('/', '%2F')}", headers=headers, params={"ref": branch})
+    payload = {"branch": branch, "content": content, "commit_message": f"runner: generate {job_id}"}
+    if check.status_code == 200:
+        requests.put(f"{api}/repository/files/{file_path.replace('/', '%2F')}", headers=headers, json=payload)
+    else:
+        requests.post(f"{api}/repository/files/{file_path.replace('/', '%2F')}", headers=headers, json=payload)
+
+    # Open MR
+    mr_resp = requests.post(f"{api}/merge_requests", headers=headers, json={
+        "source_branch": branch,
+        "target_branch": default_branch,
+        "title": f"runner: {job_id}",
+        "remove_source_branch": True,
+    })
+    mr_data = mr_resp.json()
+    mr_iid = mr_data.get("iid", "?")
+    mr_url = mr_data.get("web_url", "")
+
+    logger.emit("gitlab_push_complete", job_id=job_id, branch=branch, mr_iid=mr_iid)
+    return f"## GitLab Push\n\nBranch: `{branch}`\nFile: `{file_path}`\nMR !{mr_iid}: {mr_url}\n"
+
+
+def call_gitlab_ci_poll(post, cfg: dict, logger: "RunnerLogger", tracer) -> str:
+    """
+    Poll the GitLab CI pipeline for the MR opened by gitlab_push.
+    On failure: sends the CI log tail to the LLM for a fix, re-pushes, and retries.
+    Config: gitlab.ci_poll_interval, ci_poll_timeout, ci_max_retries, job_trace_tail_lines.
+    """
+    gl_cfg = cfg.get("gitlab", {})
+    token = _get_api_key(gl_cfg.get("token_env", "GITLAB_TOKEN"))
+    base_url = gl_cfg.get("base_url", "https://gitlab.com")
+    project_path = gl_cfg.get("scripts_project_path", "")
+    poll_interval = gl_cfg.get("ci_poll_interval", 30)
+    poll_timeout = gl_cfg.get("ci_poll_timeout", 600)
+    max_retries = gl_cfg.get("ci_max_retries", 2)
+    tail_lines = gl_cfg.get("job_trace_tail_lines", 80)
+
+    job_id = post.get("job_id", "runner-job")
+    branch = f"generated/{job_id}"
+    project_url_part = project_path.replace("/", "%2F")
+    headers = {"PRIVATE-TOKEN": token}
+    api = f"{base_url}/api/v4/projects/{project_url_part}"
+
+    def _latest_pipeline_status() -> tuple[str, int | None]:
+        resp = requests.get(f"{api}/pipelines", headers=headers, params={"ref": branch, "per_page": 1})
+        pipelines = resp.json()
+        if not pipelines:
+            return "pending", None
+        p = pipelines[0]
+        return p.get("status", "pending"), p.get("id")
+
+    def _pipeline_log_tail(pipeline_id: int) -> str:
+        jobs_resp = requests.get(f"{api}/pipelines/{pipeline_id}/jobs", headers=headers)
+        failed = [j for j in jobs_resp.json() if j.get("status") == "failed"]
+        if not failed:
+            return ""
+        trace_resp = requests.get(f"{api}/jobs/{failed[0]['id']}/trace", headers=headers)
+        lines = trace_resp.text.splitlines()
+        return "\n".join(lines[-tail_lines:])
+
+    for attempt in range(max_retries + 1):
+        deadline = time.monotonic() + poll_timeout
+        while time.monotonic() < deadline:
+            status, pipeline_id = _latest_pipeline_status()
+            logger.emit("gitlab_ci_poll", job_id=job_id, status=status, attempt=attempt + 1)
+            if status == "success":
+                return f"## CI Pipeline\n\nStatus: ✅ passed (attempt {attempt + 1})\n"
+            if status == "failed" and pipeline_id:
+                break
+            time.sleep(poll_interval)
+        else:
+            return f"## CI Pipeline\n\nStatus: ⏱ timed out after {poll_timeout}s\n"
+
+        if attempt >= max_retries:
+            break
+
+        # CI failed — ask the LLM to fix it
+        log_tail = _pipeline_log_tail(pipeline_id)
+        fix_prompt = (
+            f"The CI pipeline failed. Here is the tail of the job log:\n\n```\n{log_tail}\n```\n\n"
+            f"The original code is in the previous step context. "
+            f"Output a corrected version of the script — no explanation, no markdown fences."
+        )
+        model = post.get("model", cfg["ollama"]["default_model"])
+        step_provider = cfg.get("model_providers", {}).get(model)
+        if step_provider and step_provider in cfg:
+            fix_result = call_cloud_provider(step_provider, cfg[step_provider], model, fix_prompt)
+        else:
+            fix_result = call_ollama(
+                base_url=cfg["ollama"]["base_url"], model=model, prompt=fix_prompt,
+                timeout=cfg["ollama"].get("chain_timeout", 900),
+            )
+        call_gitlab_push(fix_result["response"], post, cfg, logger)
+        time.sleep(poll_interval)
+
+    log_tail = _pipeline_log_tail(pipeline_id) if pipeline_id else ""
+    return f"## CI Pipeline\n\nStatus: ❌ failed after {max_retries + 1} attempts\n\n```\n{log_tail[-500:]}\n```\n"
+
+
+# ─── Langfuse init ────────────────────────────────────────────────────────────
+
+def setup_langfuse() -> bool:
+    """
+    Initialise Langfuse if LANGFUSE_HOST, LANGFUSE_PUBLIC_KEY, and LANGFUSE_SECRET_KEY
+    are all present in the environment. Returns True if initialised.
+    The SDK picks up the env vars automatically — this function just validates them
+    and emits a startup log so it's clear whether tracing is active.
+    """
+    required = ("LANGFUSE_HOST", "LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY")
+    if not all(os.environ.get(k, "").strip() for k in required):
+        return False
+    try:
+        from langfuse import Langfuse
+        Langfuse()  # validates credentials at startup; raises if unreachable
+        return True
+    except Exception as exc:
+        logging.getLogger(__name__).warning("Langfuse init failed: %s", exc)
+        return False
+
+
 # ─── Checklist parsing ───────────────────────────────────────────────────────
 
 def parse_checklist_steps(content: str) -> list:
@@ -649,12 +897,11 @@ def process_staged_job(
                     attributes={"step_num": step_num, "step_text": step_text[:80]},
                 ):
                     api_start = time.monotonic()
-                    result = call_ollama(
-                        base_url=base_url,
-                        model=model,
-                        prompt=prompt,
-                        timeout=timeout,
-                    )
+                    step_provider = cfg.get("model_providers", {}).get(model)
+                    if step_provider and step_provider in cfg:
+                        result = call_cloud_provider(step_provider, cfg[step_provider], model, prompt)
+                    else:
+                        result = call_ollama(base_url=base_url, model=model, prompt=prompt, timeout=timeout)
                     api_ms = int((time.monotonic() - api_start) * 1000)
 
                 response_text = result.get("response", "")
@@ -795,25 +1042,49 @@ def process_chain_job(
         api_start = time.monotonic()
         if step_action == "search":
             step_query = step_def.get("query", step_task)
-            with tracer.start_as_current_span(
-                "searxng.search",
-                attributes={"query": step_query, "num_results": cfg.get("searxng", {}).get("num_results", 10)},
-            ):
-                response_text = call_searxng(
-                    step_query,
-                    cfg,
-                    categories=step_def.get("categories"),
-                    engines=step_def.get("engines"),
-                )
+            tavily_env = cfg.get("research", {}).get("tavily_api_key_env", "TAVILY_API_KEY")
+            backend = "tavily" if os.environ.get(tavily_env, "").strip() else "searxng"
+            with tracer.start_as_current_span("search", attributes={"query": step_query, "backend": backend}):
+                if backend == "tavily":
+                    response_text = call_tavily(step_query, cfg, categories=step_def.get("categories"))
+                else:
+                    response_text = call_searxng(
+                        step_query, cfg,
+                        categories=step_def.get("categories"),
+                        engines=step_def.get("engines"),
+                    )
+            token_count = 0
+        elif step_action == "fetch":
+            step_url = step_def.get("url", step_task.strip())
+            with tracer.start_as_current_span("fetch", attributes={"url": step_url[:200]}):
+                response_text = call_url_fetch(step_url)
+            token_count = 0
+        elif step_action == "gitlab_push":
+            with tracer.start_as_current_span("gitlab.push"):
+                response_text = call_gitlab_push(prompt, post, cfg, logger)
+            token_count = 0
+        elif step_action == "gitlab_ci_poll":
+            with tracer.start_as_current_span("gitlab.ci_poll"):
+                response_text = call_gitlab_ci_poll(post, cfg, logger, tracer)
             token_count = 0
         else:
-            result = call_ollama(
-                base_url=step_base_url,
-                model=step_model,
-                prompt=prompt,
-                image_path=step_image_path,
-                timeout=cfg["ollama"].get("chain_timeout", cfg["ollama"]["timeout"]),
-            )
+            step_provider = cfg.get("model_providers", {}).get(step_model)
+            if step_provider and step_provider in cfg:
+                with tracer.start_as_current_span(
+                    f"{step_provider}.completion", attributes={"model": step_model}
+                ):
+                    result = call_cloud_provider(step_provider, cfg[step_provider], step_model, prompt)
+            else:
+                with tracer.start_as_current_span(
+                    "ollama.generate", attributes={"model": step_model}
+                ):
+                    result = call_ollama(
+                        base_url=step_base_url,
+                        model=step_model,
+                        prompt=prompt,
+                        image_path=step_image_path,
+                        timeout=cfg["ollama"].get("chain_timeout", cfg["ollama"]["timeout"]),
+                    )
             response_text = result.get("response", "")
             token_count = result.get("eval_count", 0)
         api_ms = int((time.monotonic() - api_start) * 1000)
@@ -825,7 +1096,7 @@ def process_chain_job(
         f"job_id: {job_id}\n"
         f"chain_parent: {chain_parent}\n"
         f"step: {step_num}\n"
-        f"model: {step_model if not step_action else f'searxng ({step_action})'}\n"
+        f"model: {step_model if not step_action else step_action}\n"
         f"tokens: {token_count}\n"
         f"completed: {datetime.now(timezone.utc).isoformat()}\n"
         f"---\n\n"
@@ -1132,7 +1403,22 @@ def process_job(
         try:
             chain_final = True  # only False for intermediate chain steps
 
-            if job_type == "chain":
+            if job_type == "research":
+                # ── Research: LangGraph pipeline (search → extract → synthesise) ──
+                from research_runner import run_research_job
+                with tracer.start_as_current_span("research_pipeline", attributes={"goal": prompt[:120]}):
+                    report = run_research_job(goal=prompt, cfg=cfg)
+                token_count = 0
+                output_dir = Path(dirs["output"])
+                output_dir.mkdir(parents=True, exist_ok=True)
+                output_file = output_dir / f"{job_id}-output.md"
+                output_file.write_text(
+                    f"---\njob_id: {job_id}\ntype: research\n"
+                    f"completed: {datetime.now(timezone.utc).isoformat()}\n---\n\n{report}\n"
+                )
+                memory.index(output_file)
+
+            elif job_type == "chain":
                 # ── Chain: one step per job, spawns next automatically ─────────
                 step_num, chain_total, token_count, chain_final = process_chain_job(
                     active_file, post, base_url, model, cfg, logger, tracer, memory
@@ -1399,12 +1685,14 @@ def watch_queue(cfg: dict, logger: RunnerLogger, tracer: trace.Tracer):
     )
 
     _recover_active(cfg, logger)
+    langfuse_active = setup_langfuse()
     logger.emit(
         "runner_started",
         queue=str(queue_dir),
         poll_interval=poll_interval,
         num_workers=num_workers,
         memory_enabled=memory.enabled,
+        langfuse=langfuse_active,
     )
 
     # Spawn additional workers (worker 0 is the main thread)

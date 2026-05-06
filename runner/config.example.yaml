@@ -1,5 +1,6 @@
 # vault-runner — example config
 # Copy to config.yaml and edit for your environment.
+# Secrets (API keys, webhook URLs) go in .env — never in this file.
 
 # Root of your synced Obsidian vault on this machine.
 # On the server this is wherever Syncthing drops the vault.
@@ -13,39 +14,117 @@ dirs:
   failed:    /path/to/vault/_failed
   log_file:  /path/to/vault/RUNNER-LOG.md
 
+# ── Local Ollama ──────────────────────────────────────────────────────────────
+
 ollama:
   base_url:      http://localhost:11434
   default_model: qwen2.5:14b
   available_models:
     - qwen2.5:14b
+    - qwen2.5:7b
+    - qwen2.5-coder:7b
     - gemma3:4b
   timeout:       600   # single text/vision jobs (seconds)
   chain_timeout: 900   # chain/staged steps — longer due to accumulated context
 
-# Per-machine runner endpoints. Add a second machine here to distribute work.
+# ── Multi-machine Ollama routing ──────────────────────────────────────────────
+# Per-machine runner endpoints. Add a second machine to distribute local inference.
+
 runners:
   primary:
     base_url:      http://localhost:11434
     default_model: qwen2.5:14b
   secondary:
-    base_url:      http://10.0.0.2:11434   # e.g. Tailscale IP of a home-lab box
+    base_url:      http://10.0.0.2:11434   # e.g. Tailscale IP or Cloudflare Tunnel URL
     default_model: gemma3:4b
 
-# Model → runner auto-routing. The runner picks the machine from the model name.
+# Model → Ollama runner auto-routing (local models only).
+# Cloud models are routed via model_providers below.
 model_runners:
-  qwen2.5:14b: primary
-  gemma3:4b:   secondary
+  qwen2.5:14b:        primary
+  qwen2.5:7b:         primary
+  qwen2.5-coder:7b:   primary
+  gemma3:4b:          secondary
 
-# OpenTelemetry — traces shipped to Tempo/Grafana. Leave endpoint blank to disable.
+# ── Cloud LLM providers ───────────────────────────────────────────────────────
+# All keys are read from .env — never hardcoded here.
+# Models not listed in model_providers fall through to the Ollama runner.
+
+groq:
+  base_url:        https://api.groq.com/openai/v1   # OpenAI-compatible
+  api_key_env:     GROQ_API_KEY
+  timeout:         60
+  available_models:
+    - llama-3.3-70b-versatile
+    - llama-3.1-8b-instant
+
+anthropic:
+  api_key_env:     CLAUDE_API_KEY
+  timeout:         60
+  max_tokens:      8192   # required by Anthropic SDK — other providers ignore this
+  available_models:
+    - claude-sonnet-4-6
+
+google_ai:
+  base_url:        https://generativelanguage.googleapis.com/v1beta/openai   # OpenAI-compatible
+  api_key_env:     GOOGLEAI_API_KEY
+  timeout:         60
+  available_models:
+    - models/gemini-2.5-flash
+
+huggingface:
+  base_url:        https://router.huggingface.co/v1
+  api_key_env:     HF_TOKEN
+  timeout:         120   # HF inference is slower than dedicated APIs
+  available_models:
+    - meta-llama/Llama-3.3-70B-Instruct
+    - Qwen/Qwen2.5-72B-Instruct
+    - google/gemma-3-27b-it
+
+# Maps model names to their provider section above.
+# Unlisted models default to Ollama (local runner).
+model_providers:
+  llama-3.3-70b-versatile:          groq
+  llama-3.1-8b-instant:             groq
+  claude-sonnet-4-6:                anthropic
+  models/gemini-2.5-flash:          google_ai
+  meta-llama/Llama-3.3-70B-Instruct: huggingface
+  Qwen/Qwen2.5-72B-Instruct:        huggingface
+  google/gemma-3-27b-it:            huggingface
+
+# ── Observability ─────────────────────────────────────────────────────────────
+
+# OpenTelemetry — infrastructure traces (job lifecycle, LLM call latency).
+# Shipped to Tempo/Grafana. Leave endpoint blank to disable.
 otel:
   endpoint:     http://localhost:4317
   service_name: vault-runner
 
-# Discord alerts — leave blank to disable.
-discord:
-  webhook_url: ""
+# Langfuse — LLM-specific traces (prompts, completions, token usage per call).
+# Separate pipeline from OTel — both run independently.
+# SDK reads LANGFUSE_HOST, LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY from env.
+# Note: use LANGFUSE_HOST not LANGFUSE_BASE_URL — the SDK ignores the latter.
+langfuse:
+  enabled: false
+  host_env: LANGFUSE_HOST   # e.g. http://your-langfuse-instance:3000
 
-# SearXNG metasearch for `action: search` chain steps.
+# Discord — job completion and failure alerts. Leave blank to disable.
+discord:
+  webhook_url_env: DISCORD_WEBHOOK_URL
+
+# ── Web search ────────────────────────────────────────────────────────────────
+
+# Tavily — cloud search API for `action: search` chain steps (recommended).
+# Sign up at tavily.com for a free-tier key.
+research:
+  tavily_api_key_env: TAVILY_API_KEY
+  default_search_depth: basic   # or "advanced" for deeper results
+  max_results: 10
+
+# SearXNG — self-hosted metasearch fallback. Used if Tavily key is not set.
+# Note: must be reachable from the machine running the runner. LAN-only instances
+# will not work from a remote VPS — assign a Tailscale address or deploy SearXNG
+# on the same host.
 searxng:
   base_url: http://searxng.local
   default_categories: it
@@ -53,7 +132,10 @@ searxng:
   timeout: 30
   enabled: false
 
-# MemPalace — semantic memory over past outputs and vault content (see ./mempalace).
+# ── Semantic memory ───────────────────────────────────────────────────────────
+
+# MemPalace — vector search over past job outputs and vault content.
+# See ./mempalace for the MCP server that exposes this to Claude Code too.
 mempalace:
   enabled: false
   store_path: /path/to/mempalace-store
@@ -61,21 +143,51 @@ mempalace:
   max_chars_per_result: 400
   smart_query_model: qwen2.5:7b
   smart_query_results_per_query: 2
+  palaces:
+    default: /path/to/mempalace-store   # additional named palaces shown in UI
 
-poll_interval: 5
-num_workers: 2
+# ── LangGraph research pipeline ───────────────────────────────────────────────
+# Used by job_type: research. Runs a multi-step agentic search → extract → synthesise loop.
 
-# Chain job templates shown in the UI template picker.
+langgraph_research:
+  default_model:    qwen2.5:14b   # synthesis model (can be any provider)
+  kuzu_db_path:     /path/to/research-graph   # KuzuDB graph for entity/relation storage
+  output_format:    markdown
+  max_search_iterations: 3   # how many search → extract cycles before synthesising
+
+# ── GitLab CI/CD integration ──────────────────────────────────────────────────
+# Used by action: gitlab_push and action: gitlab_ci_poll chain steps.
+# Enables an LLM code-gen loop: generate → push → CI runs → fix on failure → retry.
+
+gitlab:
+  base_url:            https://gitlab.com
+  token_env:           GITLAB_TOKEN   # needs api scope
+  scripts_project_path: your-namespace/your-repo
+  default_branch:      main
+  ci_poll_interval:    30    # seconds between pipeline status checks
+  ci_poll_timeout:     600   # give up after this many seconds
+  ci_max_retries:      2     # LLM fix attempts after CI failure (3 total runs)
+  job_trace_tail_lines: 80   # CI failure log lines sent to the fix-retry prompt
+
+# ── Runtime ───────────────────────────────────────────────────────────────────
+
+poll_interval: 5    # seconds between _queue/ scans (restart required to change)
+num_workers:   2    # parallel job threads (restart required to change)
+
+# ── Chain job templates ───────────────────────────────────────────────────────
+
 templates:
   - name: "Quick Model Test"
+    description: "Run the same prompt through two models and compare outputs"
     model: qwen2.5:14b
     steps:
       - prompt: "Write 3 bullet points about why local LLMs are useful. Keep it brief."
         model: qwen2.5:14b
       - prompt: "Review the 3 points above and add one sentence of critique to each."
-        model: qwen2.5:14b
+        model: llama-3.3-70b-versatile   # cloud model for comparison
 
   - name: "Web Search"
+    description: "Search the web and synthesise a structured answer"
     model: qwen2.5:14b
     steps:
       - action: search
@@ -90,9 +202,25 @@ templates:
           Include: key conclusions, important caveats, and 3–5 actionable next steps.
         model: qwen2.5:14b
 
+  - name: "Document Fetch"
+    description: "Fetch a URL, extract the main content, and analyse it"
+    model: llama-3.3-70b-versatile
+    steps:
+      - action: fetch
+        url: ""
+      - prompt: |
+          Extract the key information from the document above: main argument, supporting
+          evidence, data points, and any conclusions. Be concise and structured.
+        model: llama-3.3-70b-versatile
+      - prompt: |
+          Based on the extraction above, write a critical analysis. What is strong?
+          What is missing or weakly supported? What follow-up questions remain?
+        model: llama-3.3-70b-versatile
+
   - name: "Vault Search"
+    description: "Search your vault memory and produce a structured briefing"
     model: qwen2.5:14b
-    use_memory: true
+    use_memory: smart
     steps:
       - prompt: |
           The vault context above is drawn from your knowledge base.
@@ -107,6 +235,7 @@ templates:
         model: qwen2.5:14b
 
   - name: "Document Analysis"
+    description: "Three-stage extract → analyse → report pipeline"
     model: qwen2.5:14b
     steps:
       - prompt: |
@@ -123,4 +252,32 @@ templates:
           - Key findings
           - Critical analysis and gaps
           - Recommendations or next steps
+        model: qwen2.5:14b
+
+  - name: "LLM Code Gen"
+    description: "Generate a Python script, push to GitLab, wait for CI to go green"
+    model: qwen2.5-coder:7b
+    steps:
+      - prompt: |
+          Write a clean, well-commented Python script that solves the task below.
+          Output only the script — no explanation, no markdown fences.
+        model: qwen2.5-coder:7b
+      - action: gitlab_push
+      - action: gitlab_ci_poll
+
+  - name: "Python Learn Loop"
+    description: "Write code, review it, then explain the concepts"
+    model: qwen2.5-coder:7b
+    steps:
+      - prompt: |
+          Write a Python solution with clear variable names and minimal comments.
+          Explain the approach in 2 sentences before the code block.
+        model: qwen2.5-coder:7b
+      - prompt: |
+          Review the code above. Identify: any bugs, style issues, edge cases not handled,
+          and one alternative approach worth considering.
+        model: qwen2.5:14b
+      - prompt: |
+          Based on the code and review above, explain the core Python concepts used.
+          Target a developer who knows another language but is new to Python.
         model: qwen2.5:14b
